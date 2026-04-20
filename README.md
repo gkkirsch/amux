@@ -20,6 +20,12 @@ make install      # builds + copies to ~/.local/bin/amux
 
 Requires tmux 3.x and Go 1.21+ to build.
 
+**See [AGENTS.md](./AGENTS.md) for the cookbook** — recipes, gotchas, and
+the pragmatic guide for driving Claude Code (and other TUIs) from a
+script or an agent.
+
+Every command has detailed help: `amux <cmd> -h`.
+
 ## Commands
 
 ### Lifecycle
@@ -28,8 +34,11 @@ Requires tmux 3.x and Go 1.21+ to build.
 | `amux new <session>` | Create a detached session |
 | `amux window <session> [-n name] [-- cmd ...]` | New window, optionally running a command |
 | `amux split <target> [-h\|-v] [-- cmd ...]` | Split a pane (`-v` top/bottom default, `-h` left/right) |
+| `amux rename <target> <new-name>` | Rename session/window (pane: set title) |
+| `amux color <target> <color>` | Tint window-status or pane border |
 | `amux kill <target>` | Kill a session / window / pane (dispatched by target shape) |
 | `amux list [--json]` | List all sessions/windows/panes |
+| `amux exists <target>` | Silent exact-match existence check (exit 0/1) |
 
 ### Input
 Each input primitive has one job — no overloaded "send" that sometimes
@@ -52,7 +61,13 @@ fixed against Claude Code.
 | Command | What it does |
 |---|---|
 | `amux capture <target> [--lines N] [--json] [--escapes]` | `capture-pane -p`. `--lines` pulls scrollback; `--escapes` preserves ANSI color/highlight |
-| `amux wait-idle <target> [--quiet 800ms] [--timeout 60s] [--interval 200ms]` | Block until capture output hasn't changed for `--quiet`. Non-zero exit on timeout. |
+| `amux wait-idle <target> [--quiet 800ms] [--timeout 60s] [--interval 200ms]` | Heuristic: block until capture output hasn't changed for `--quiet`. Non-zero exit on timeout. |
+| `amux wait-for <target> <pattern> [--timeout 60s] [--interval 200ms] [--lines 0]` | Deterministic: block until a Go regex matches. |
+
+### Agent one-shot
+| Command | What it does |
+|---|---|
+| `amux run <target> [--quiet 2s] [--timeout 120s] < prompt` | Read stdin → paste+submit → wait-idle → emit the NEW content added since submit. The "ask and read reply" primitive. |
 
 ## The hard part: reliable input into Claude Code
 
@@ -167,12 +182,21 @@ Beyond the automated suite, the following scenarios were driven by hand:
 ```
 amux new demo
 amux window demo -n cc -- claude --dangerously-skip-permissions
-sleep 5                                       # let the TUI draw
-echo "what is 17*23? reply with just the number" \
-  | amux paste demo:cc --submit
-amux wait-idle demo:cc --quiet 2s --timeout 30s
-amux capture demo:cc | grep '⏺'               # ⏺ 391
+amux wait-for demo:cc '❯' --timeout 45s      # TUI is ready
+
+echo "what is 17*23? reply with just the number" | amux run demo:cc
+# → ⏺ 391
+
 amux kill demo
+```
+
+The underlying primitives (`paste --submit` + `wait-idle` + `capture`)
+are also available if you want direct control:
+
+```
+echo "what is 17*23?" | amux paste demo:cc --submit
+amux wait-idle demo:cc --quiet 2s --timeout 30s
+amux capture demo:cc | grep '⏺'
 ```
 
 ## Target format

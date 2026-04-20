@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -339,6 +340,363 @@ func cmdCapture(args []string) error {
 	}
 	fmt.Print(out)
 	return nil
+}
+
+// --- existence / waiting / one-shot ----------------------------------------
+
+// cmdExists is a silent "does target exist?" check. Zero exit = exists,
+// non-zero = doesn't. Nothing printed, to keep the output parseable in
+// scripts. Uses display-message because it resolves any target shape
+// (session, window, pane) in a single call.
+func cmdExists(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: amux exists <target>")
+	}
+	ok, err := targetExists(args[0])
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// Silent non-zero: no stderr either, to match common "test"-style
+		// probes.
+		os.Exit(1)
+	}
+	return nil
+}
+
+// targetExists does an EXACT-name check. tmux's own `-t` resolution does
+// prefix matching ("foo" matches "foo-bar"), which makes it useless for
+// existence checks — so we enumerate and compare.
+func targetExists(target string) (bool, error) {
+	sess, win, pane := parseTarget(target)
+
+	sessions, err := listValues("list-sessions", "-F", "#{session_name}")
+	if err != nil {
+		if isNoServer(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !contains(sessions, sess) {
+		return false, nil
+	}
+	if win == "" {
+		return true, nil
+	}
+
+	// win can be a numeric index ("1") or a name ("cc"). We match either.
+	winRows, err := listValues("list-windows", "-t", sess,
+		"-F", "#{window_index}\t#{window_name}")
+	if err != nil {
+		return false, err
+	}
+	winMatched := ""
+	for _, row := range winRows {
+		parts := strings.SplitN(row, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if parts[0] == win || parts[1] == win {
+			winMatched = parts[0]
+			break
+		}
+	}
+	if winMatched == "" {
+		return false, nil
+	}
+	if pane == "" {
+		return true, nil
+	}
+
+	panes, err := listValues("list-panes", "-t", sess+":"+winMatched,
+		"-F", "#{pane_index}")
+	if err != nil {
+		return false, err
+	}
+	return contains(panes, pane), nil
+}
+
+// parseTarget splits session[:window[.pane]] into its pieces.
+func parseTarget(t string) (sess, win, pane string) {
+	if i := strings.Index(t, ":"); i >= 0 {
+		sess = t[:i]
+		rest := t[i+1:]
+		if j := strings.Index(rest, "."); j >= 0 {
+			win = rest[:j]
+			pane = rest[j+1:]
+		} else {
+			win = rest
+		}
+	} else {
+		sess = t
+	}
+	return
+}
+
+func listValues(tmuxArgs ...string) ([]string, error) {
+	out, err := tmux(tmuxArgs...)
+	if err != nil {
+		return nil, err
+	}
+	out = strings.TrimRight(out, "\n")
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
+}
+
+func contains(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// cmdWaitFor polls capture-pane until a regex matches, or --timeout
+// elapses. This is the deterministic complement to wait-idle: use
+// wait-idle when you don't know what marker to look for; use wait-for
+// when you do.
+func cmdWaitFor(args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: amux wait-for <target> <pattern> [--timeout 60s] [--interval 200ms] [--lines 0]")
+	}
+	target := args[0]
+	pattern := args[1]
+	fs := flag.NewFlagSet("wait-for", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	timeout := fs.Duration("timeout", 60*time.Second, "overall timeout")
+	interval := fs.Duration("interval", 200*time.Millisecond, "poll interval")
+	lines := fs.Int("lines", 0, "include last N history lines in each capture (0 = visible only)")
+	if err := fs.Parse(args[2:]); err != nil {
+		return err
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return fmt.Errorf("invalid regex %q: %w", pattern, err)
+	}
+	deadline := time.Now().Add(*timeout)
+	for {
+		cap, err := captureText(target, *lines)
+		if err != nil {
+			return err
+		}
+		if re.MatchString(cap) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("wait-for: pattern %q did not match in %s on %s", pattern, *timeout, target)
+		}
+		time.Sleep(*interval)
+	}
+}
+
+// cmdRun is the agent one-shot: reads stdin, pastes+submits, waits until
+// the pane goes quiet, then emits ONLY the new content added since the
+// submit. That's the primitive agents actually want for "ask and read the
+// reply". If the pane's scrollback has rolled past our pre-submit snapshot
+// we fall back to emitting the full post-submit capture.
+func cmdRun(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: amux run <target> [--quiet 2s] [--timeout 120s] [--lines 2000] < prompt")
+	}
+	target := args[0]
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	quiet := fs.Duration("quiet", 2*time.Second, "wait-idle quiescence threshold")
+	timeout := fs.Duration("timeout", 120*time.Second, "wait-idle overall timeout")
+	interval := fs.Duration("interval", 300*time.Millisecond, "wait-idle poll interval")
+	bracketed := fs.Bool("bracketed", true, "use bracketed paste")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return fmt.Errorf("read stdin: %w", err)
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("run: stdin was empty (did you pipe a prompt in?)")
+	}
+	data = sanitizeBracketedPaste(data)
+
+	// Stabilize the pane before snapshotting. Otherwise the target might
+	// still be mid-redraw (e.g. shell finishing a new prompt after the
+	// previous command), and the cursor_y we read would be off — the
+	// delta would include content that was "in flight" at sample time.
+	if err := waitIdleFunc(target, 300*time.Millisecond, 5*time.Second, 100*time.Millisecond); err != nil {
+		return err
+	}
+
+	// Snapshot: use tmux's own history_size + visible-line count as our
+	// "where are we in the transcript" anchor. Line-based slicing is far
+	// more robust than string-prefix matching across redraws.
+	beforeOffset, err := paneLineOffset(target)
+	if err != nil {
+		return err
+	}
+
+	buf := fmt.Sprintf("amux-%d-%d", os.Getpid(), time.Now().UnixNano())
+	if _, err := tmuxStdin(data, "load-buffer", "-b", buf, "-"); err != nil {
+		return err
+	}
+	pasteArgs := []string{"paste-buffer", "-b", buf, "-t", target, "-d"}
+	if *bracketed {
+		pasteArgs = append(pasteArgs, "-p")
+	}
+	if _, err := tmux(pasteArgs...); err != nil {
+		return err
+	}
+	if _, err := tmux("send-keys", "-t", target, "Enter"); err != nil {
+		return err
+	}
+
+	// wait-idle inline so we don't double-parse args.
+	if err := waitIdleFunc(target, *quiet, *timeout, *interval); err != nil {
+		return err
+	}
+
+	afterOffset, afterHS, err := paneOffsetAndHistory(target)
+	if err != nil {
+		return err
+	}
+	// Convert our absolute "lines-elapsed" marker into tmux's -S coordinate:
+	//   relStart = beforeOffset - afterHistorySize
+	// Positive means "line N of visible pane from top". Negative means
+	// "N lines up from visible top (into scrollback)". Either way,
+	// tmux captures from that point down to the current bottom.
+	relStart := beforeOffset - afterHS
+	if relStart > afterOffset-afterHS {
+		// No movement — snap to current cursor line so we still emit at
+		// least one line (Claude's ⏺ reply on an unchanged screen).
+		relStart = afterOffset - afterHS
+	}
+	out, err := tmux("capture-pane", "-p", "-t", target,
+		"-S", strconv.Itoa(relStart))
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+// paneOffsetAndHistory returns (absolute_cursor_line, history_size) for
+// the target pane. The absolute line is `history_size + cursor_y` —
+// history_size grows as content scrolls out of the visible screen, so
+// the sum increases monotonically whenever the pane emits output.
+func paneOffsetAndHistory(target string) (int, int, error) {
+	out, err := tmux("display-message", "-p", "-t", target,
+		"#{history_size} #{cursor_y}")
+	if err != nil {
+		return 0, 0, err
+	}
+	parts := strings.Fields(strings.TrimSpace(out))
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("unexpected display-message output: %q", out)
+	}
+	hs, err1 := strconv.Atoi(parts[0])
+	cy, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return 0, 0, fmt.Errorf("parse display-message: %v %v (%q)", err1, err2, out)
+	}
+	return hs + cy, hs, nil
+}
+
+func paneLineOffset(target string) (int, error) {
+	off, _, err := paneOffsetAndHistory(target)
+	return off, err
+}
+
+// captureText is the Go-side version of `amux capture`, used internally.
+func captureText(target string, lines int) (string, error) {
+	args := []string{"capture-pane", "-p", "-t", target}
+	if lines > 0 {
+		args = append(args, "-S", fmt.Sprintf("-%d", lines))
+	}
+	return tmux(args...)
+}
+
+// waitIdleFunc is the Go-side version of `amux wait-idle`, used internally
+// by `run` so we don't shell out to ourselves.
+func waitIdleFunc(target string, quiet, timeout, interval time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastCap string
+	lastChange := time.Now()
+	first := true
+	for {
+		out, err := tmux("capture-pane", "-p", "-t", target)
+		if err != nil {
+			return err
+		}
+		if first || out != lastCap {
+			lastCap = out
+			lastChange = time.Now()
+			first = false
+		} else if time.Since(lastChange) >= quiet {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("wait-idle: timed out after %s on %s", timeout, target)
+		}
+		time.Sleep(interval)
+	}
+}
+
+
+// --- rename / color --------------------------------------------------------
+
+func cmdRename(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: amux rename <target> <new-name>")
+	}
+	target, name := args[0], args[1]
+	switch {
+	case strings.Contains(target, "."):
+		// Pane: use pane title via select-pane -T.
+		_, err := tmux("select-pane", "-t", target, "-T", name)
+		return err
+	case strings.Contains(target, ":"):
+		_, err := tmux("rename-window", "-t", target, name)
+		return err
+	default:
+		_, err := tmux("rename-session", "-t", target, name)
+		return err
+	}
+}
+
+// cmdColor tints the window-status entry (for window targets) or pane
+// border (for pane targets) so a human watching the session can tell
+// multiple agents apart at a glance. Accepts tmux color names (red,
+// green, yellow, blue, magenta, cyan, white, black, chartreuse, ...)
+// or hex like "#80ff00". Session targets are not supported — color
+// applies per-window and per-pane.
+func cmdColor(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: amux color <target> <color>  (window or pane target)")
+	}
+	target, color := args[0], args[1]
+	switch {
+	case strings.Contains(target, "."):
+		// Pane: set pane-border-style. User also needs `pane-border-status`
+		// set to show borders — we enable it per-pane if possible.
+		_, err := tmux("set-option", "-p", "-t", target, "pane-border-style", "fg="+color+",bold")
+		if err != nil {
+			return err
+		}
+		// Make borders visible (top border shows titles too).
+		_, _ = tmux("set-option", "-t", target, "pane-border-status", "top")
+		return nil
+	case strings.Contains(target, ":"):
+		// Window: color the status bar entry.
+		_, err := tmux("set-window-option", "-t", target, "window-status-style", "fg="+color+",bold")
+		if err != nil {
+			return err
+		}
+		_, err = tmux("set-window-option", "-t", target, "window-status-current-style", "fg="+color+",bold,reverse")
+		return err
+	default:
+		return fmt.Errorf("color: target must be a window or pane (got session %q)", target)
+	}
 }
 
 func cmdWaitIdle(args []string) error {

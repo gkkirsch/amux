@@ -460,7 +460,9 @@ func TestPasteStripsBracketedPasteSentinels(t *testing.T) {
 
 	// Content embeds the end sentinel in the middle.
 	payload := "before\n\x1b[201~middle\n\x1b[200~after\n"
-	mustAmux(t, payload, "paste", target)
+	// --bracketed=false: isolate the sanitizer from tmux's own outer
+	// wrapping, which varies across tmux versions for non-TUI consumers.
+	mustAmux(t, payload, "paste", target, "--bracketed=false")
 	mustAmux(t, "", "key", target, "C-d")
 
 	waitFor(t, 3*time.Second, "stripped file", func() bool {
@@ -471,6 +473,165 @@ func TestPasteStripsBracketedPasteSentinels(t *testing.T) {
 	want := "before\nmiddle\nafter\n"
 	if string(got) != want {
 		t.Fatalf("sentinels weren't stripped.\n  want: %q\n  got:  %q", want, string(got))
+	}
+}
+
+// --- new commands: exists / wait-for / run / rename / color --------------
+
+func TestExists(t *testing.T) {
+	sess := uniqueSession(t)
+	// Session exists → exit 0.
+	if r := runAmux(t, "", "exists", sess); r.exit != 0 {
+		t.Fatalf("exists on real session: exit=%d stderr=%s", r.exit, r.stderr)
+	}
+	// Nonexistent → non-zero.
+	if r := runAmux(t, "", "exists", "definitely-not-a-session-xyz"); r.exit == 0 {
+		t.Fatalf("exists on fake session should fail")
+	}
+	// Silent: no stdout on success.
+	r := runAmux(t, "", "exists", sess)
+	if r.stdout != "" {
+		t.Fatalf("exists should be silent, got stdout: %q", r.stdout)
+	}
+}
+
+func TestWaitForMatches(t *testing.T) {
+	sess := uniqueSession(t)
+	// Trigger delayed output.
+	mustAmux(t, "", "window", sess, "-n", "emit", "--",
+		"sh", "-c", "sleep 0.4; echo READY-MARKER; sleep 30")
+	start := time.Now()
+	mustAmux(t, "", "wait-for", sess+":emit", "READY-MARKER",
+		"--timeout", "5s", "--interval", "100ms")
+	elapsed := time.Since(start)
+	if elapsed > 3*time.Second {
+		t.Fatalf("wait-for should match quickly after the line appears, took %s", elapsed)
+	}
+}
+
+func TestWaitForTimeout(t *testing.T) {
+	sess := uniqueSession(t)
+	r := runAmux(t, "", "wait-for", sess+":0", "NEVER_APPEARS",
+		"--timeout", "600ms", "--interval", "100ms")
+	if r.exit == 0 {
+		t.Fatalf("wait-for should exit non-zero on timeout")
+	}
+	if !strings.Contains(r.stderr, "did not match") {
+		t.Fatalf("expected 'did not match' in stderr, got: %s", r.stderr)
+	}
+}
+
+func TestWaitForInvalidRegex(t *testing.T) {
+	sess := uniqueSession(t)
+	r := runAmux(t, "", "wait-for", sess+":0", "[bad", "--timeout", "1s")
+	if r.exit == 0 {
+		t.Fatalf("expected non-zero on invalid regex")
+	}
+	if !strings.Contains(r.stderr, "invalid regex") {
+		t.Fatalf("expected 'invalid regex' in stderr, got: %s", r.stderr)
+	}
+}
+
+// TestRun proves the paste+submit+wait-idle+delta flow works against a
+// real shell. The delta emitted should contain our echoed marker and
+// NOT the earlier "prompt" we wrote before submitting.
+func TestRun(t *testing.T) {
+	sess := uniqueSession(t)
+	target := sess + ":0"
+	// Shell needs to be ready — print a marker and sync on it first.
+	mustAmux(t, "", "send", target, "echo PRE-MARKER")
+	mustAmux(t, "", "key", target, "Enter")
+	mustAmux(t, "", "wait-for", target, "PRE-MARKER", "--timeout", "3s")
+
+	// `run` pastes "echo RUN-REPLY" + Enter, waits for idle, emits
+	// the new content.
+	out := mustAmux(t, "echo RUN-REPLY-42\n", "run", target,
+		"--quiet", "600ms", "--timeout", "10s", "--interval", "100ms", "--bracketed=false")
+	if !strings.Contains(out, "RUN-REPLY-42") {
+		t.Fatalf("run didn't return the reply:\n%s", out)
+	}
+	if strings.Contains(out, "PRE-MARKER") {
+		t.Fatalf("run delta should not include pre-submit PRE-MARKER:\n%s", out)
+	}
+}
+
+func TestRunEmptyStdin(t *testing.T) {
+	sess := uniqueSession(t)
+	r := runAmux(t, "", "run", sess+":0", "--timeout", "2s")
+	if r.exit == 0 {
+		t.Fatalf("run with empty stdin should fail")
+	}
+	if !strings.Contains(r.stderr, "empty") {
+		t.Fatalf("expected 'empty' in stderr, got: %s", r.stderr)
+	}
+}
+
+func TestRenameSession(t *testing.T) {
+	sess := uniqueSession(t)
+	newName := sess + "-renamed"
+	mustAmux(t, "", "rename", sess, newName)
+	t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", newName).Run() })
+	// Old name gone, new name exists.
+	if r := runAmux(t, "", "exists", sess); r.exit == 0 {
+		t.Fatalf("old session name %s should be gone", sess)
+	}
+	if r := runAmux(t, "", "exists", newName); r.exit != 0 {
+		t.Fatalf("new session name %s should exist: %s", newName, r.stderr)
+	}
+}
+
+func TestRenameWindow(t *testing.T) {
+	sess := uniqueSession(t)
+	mustAmux(t, "", "window", sess, "-n", "before")
+	mustAmux(t, "", "rename", sess+":before", "after")
+	out := mustAmux(t, "", "list", "--json")
+	if !strings.Contains(out, `"after"`) {
+		t.Fatalf("renamed window 'after' not in list:\n%s", out)
+	}
+	if strings.Contains(out, `"before"`) {
+		t.Fatalf("old name 'before' should be gone:\n%s", out)
+	}
+}
+
+func TestColorWindow(t *testing.T) {
+	sess := uniqueSession(t)
+	mustAmux(t, "", "window", sess, "-n", "tagged")
+	// Setting a color should succeed. The effect is visual only; we
+	// verify by reading the option back via tmux directly.
+	mustAmux(t, "", "color", sess+":tagged", "red")
+	out, err := exec.Command("tmux", "show-window-options", "-t",
+		sess+":tagged", "window-status-style").Output()
+	if err != nil {
+		t.Fatalf("show-window-options: %v", err)
+	}
+	if !strings.Contains(string(out), "red") {
+		t.Fatalf("expected 'red' in window-status-style, got: %s", string(out))
+	}
+}
+
+func TestColorSessionErrors(t *testing.T) {
+	sess := uniqueSession(t)
+	r := runAmux(t, "", "color", sess, "red")
+	if r.exit == 0 {
+		t.Fatalf("color on session should fail")
+	}
+	if !strings.Contains(r.stderr, "must be a window or pane") {
+		t.Fatalf("expected helpful error, got: %s", r.stderr)
+	}
+}
+
+// TestHelpPerCommand proves `amux <cmd> -h` prints the command-specific
+// help text, not the top-level usage.
+func TestHelpPerCommand(t *testing.T) {
+	r := runAmux(t, "", "paste", "-h")
+	if r.exit != 0 {
+		t.Fatalf("amux paste -h should exit 0, got %d", r.exit)
+	}
+	if !strings.Contains(r.stdout, "bracketed paste") {
+		t.Fatalf("expected paste help to mention 'bracketed paste':\n%s", r.stdout)
+	}
+	if strings.Contains(r.stdout, "amux <command> [flags]") {
+		t.Fatalf("paste -h printed the top-level usage instead of the command help")
 	}
 }
 
