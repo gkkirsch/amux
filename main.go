@@ -20,6 +20,8 @@ Lifecycle:
   kill    <target>                              Kill session/window/pane.
   list    [--json]                              List everything.
   exists  <target>                              Silent existence check (exit 0/1).
+  log     <target> <file|off>                   Pipe everything the pane prints to <file>
+                                                (append). 'off' stops the pipe.
 
 Input (each primitive does ONE thing):
   send  <target> <text>                         Literal text (-l --). 'Enter' stays as 5 chars.
@@ -253,6 +255,27 @@ Examples:
   amux wait-for agent1:cc 'DONE[0-9]+' --timeout 120s
   amux wait-for agent1:cc 'exited' --lines 500`,
 
+	"log": `amux log <target> <file|off>
+
+Start or stop piping pane output to a file. 'amux log sess:cc out.log'
+turns the pipe on (append mode). 'amux log sess:cc off' detaches it.
+
+Implemented via tmux's pipe-pane. Everything the pane prints (prompts,
+typed input echoed back, command output, TUI redraws) is streamed to
+the file. This is the cheapest way to get a persistent transcript of
+an agent's work without polling capture-pane.
+
+If <file> is a relative path, it's resolved against amux's current
+working directory — tmux's own cwd is unreliable.
+
+Examples:
+  amux log sess:cc /tmp/sess-cc.transcript
+  amux log sess:cc off
+  # Per-session transcripts:
+  for w in alpha beta gamma; do
+    amux log fleet:$w "/tmp/fleet-$w.log"
+  done`,
+
 	"exists": `amux exists <target>
 
 Silent existence check. Exit 0 if the target (session/window/pane)
@@ -340,6 +363,8 @@ func main() {
 		err = cmdRename(args)
 	case "color":
 		err = cmdColor(args)
+	case "log":
+		err = cmdLog(args)
 	case "-h", "--help", "help":
 		fmt.Print(usageText)
 		return

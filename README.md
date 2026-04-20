@@ -39,6 +39,7 @@ Every command has detailed help: `amux <cmd> -h`.
 | `amux kill <target>` | Kill a session / window / pane (dispatched by target shape) |
 | `amux list [--json]` | List all sessions/windows/panes |
 | `amux exists <target>` | Silent exact-match existence check (exit 0/1) |
+| `amux log <target> <file\|off>` | Pipe everything the pane prints to `<file>` (append), or `off` to detach |
 
 ### Input
 Each input primitive has one job — no overloaded "send" that sometimes

@@ -55,6 +55,9 @@ func cmdWindow(args []string) error {
 		return fmt.Errorf("usage: amux window <session> [-n name] [-- cmd ...]")
 	}
 	session := args[0]
+	if err := mustExist(session); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("window", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	name := fs.String("n", "", "window name")
@@ -78,6 +81,9 @@ func cmdSplit(args []string) error {
 		return fmt.Errorf("usage: amux split <target> [-h|-v] [-- cmd ...]")
 	}
 	target := args[0]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("split", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	horiz := fs.Bool("h", false, "horizontal split (left/right)")
@@ -101,6 +107,9 @@ func cmdKill(args []string) error {
 		return fmt.Errorf("usage: amux kill <target>")
 	}
 	target := args[0]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	// Dispatch by target shape: "sess" → session, "sess:win" → window,
 	// "sess:win.pane" → pane. tmux itself would also accept the plain
 	// target for kill-pane, but being explicit gives clearer errors.
@@ -190,6 +199,9 @@ func cmdSend(args []string) error {
 		return fmt.Errorf("usage: amux send <target> <text>  (literal — 'Enter' stays as 5 chars)")
 	}
 	target, text := args[0], args[1]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	// -l = literal: tmux won't interpret tokens like "Enter" as key names.
 	// The trailing "--" tells tmux "no more flags" — without it, user text
 	// beginning with "-" (e.g. "--verbose") fails tmux's flag parser.
@@ -202,6 +214,9 @@ func cmdKey(args []string) error {
 		return fmt.Errorf("usage: amux key <target> <key> [<key>...] [--repeat N] [--delay 80ms]")
 	}
 	target := args[0]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	// Separate positional keys from flags so --repeat / --delay can appear
 	// anywhere after the target (e.g. `amux key t Down --repeat 5`).
 	var keys []string
@@ -246,6 +261,9 @@ func cmdPaste(args []string) error {
 		return fmt.Errorf("usage: amux paste <target> [--submit]  (reads content from stdin)")
 	}
 	target := args[0]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("paste", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	submit := fs.Bool("submit", false, "send Enter after paste")
@@ -290,6 +308,9 @@ func cmdType(args []string) error {
 		return fmt.Errorf("usage: amux type <target> <text> [--delay 20ms]")
 	}
 	target, text := args[0], args[1]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("type", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	delay := fs.Duration("delay", 20*time.Millisecond, "delay between chars")
@@ -312,6 +333,9 @@ func cmdCapture(args []string) error {
 		return fmt.Errorf("usage: amux capture <target> [--lines N] [--json]")
 	}
 	target := args[0]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("capture", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	lines := fs.Int("lines", 0, "include last N history lines (0 = visible screen only)")
@@ -454,21 +478,53 @@ func contains(ss []string, s string) bool {
 	return false
 }
 
+// mustExist returns an error if target doesn't resolve to a real session,
+// window, or pane via EXACT matching. tmux's own `-t` does prefix
+// matching ("foo" matches "foo-bar"), which quietly misroutes commands
+// after a rename or when multiple sessions share a prefix — a real
+// orchestrator hazard. Every command that operates on an existing
+// target routes through mustExist first.
+//
+// Set AMUX_LOOSE_TARGETS=1 to opt out and fall back to tmux's default
+// resolution.
+func mustExist(target string) error {
+	if os.Getenv("AMUX_LOOSE_TARGETS") == "1" {
+		return nil
+	}
+	ok, err := targetExists(target)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no such target %q (set AMUX_LOOSE_TARGETS=1 to skip this check)", target)
+	}
+	return nil
+}
+
 // cmdWaitFor polls capture-pane until a regex matches, or --timeout
 // elapses. This is the deterministic complement to wait-idle: use
 // wait-idle when you don't know what marker to look for; use wait-for
 // when you do.
+//
+// --new-only guards against the classic orchestrator bug: you pass the
+// orchestrator a prompt that mentions your completion marker, the
+// prompt gets echoed into the pane, and wait-for matches on that echo
+// rather than on the actual completion.
 func cmdWaitFor(args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: amux wait-for <target> <pattern> [--timeout 60s] [--interval 200ms] [--lines 0]")
+		return fmt.Errorf("usage: amux wait-for <target> <pattern> [--timeout 60s] [--interval 200ms] [--lines 0] [--new-only]")
 	}
 	target := args[0]
 	pattern := args[1]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("wait-for", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	timeout := fs.Duration("timeout", 60*time.Second, "overall timeout")
 	interval := fs.Duration("interval", 200*time.Millisecond, "poll interval")
 	lines := fs.Int("lines", 0, "include last N history lines in each capture (0 = visible only)")
+	newOnly := fs.Bool("new-only", false, "only match content added AFTER this command starts (ignore existing pane content)")
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
@@ -476,13 +532,27 @@ func cmdWaitFor(args []string) error {
 	if err != nil {
 		return fmt.Errorf("invalid regex %q: %w", pattern, err)
 	}
-	deadline := time.Now().Add(*timeout)
-	for {
-		cap, err := captureText(target, *lines)
+
+	var anchorOffset int
+	if *newOnly {
+		anchorOffset, err = paneLineOffset(target)
 		if err != nil {
 			return err
 		}
-		if re.MatchString(cap) {
+	}
+
+	deadline := time.Now().Add(*timeout)
+	for {
+		var searchIn string
+		if *newOnly {
+			searchIn, err = captureSince(target, anchorOffset)
+		} else {
+			searchIn, err = captureText(target, *lines)
+		}
+		if err != nil {
+			return err
+		}
+		if re.MatchString(searchIn) {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -490,6 +560,18 @@ func cmdWaitFor(args []string) error {
 		}
 		time.Sleep(*interval)
 	}
+}
+
+// captureSince captures pane content from the given absolute line anchor
+// (history_size + cursor_y when the anchor was taken) down to the
+// current bottom. Converts the absolute anchor to tmux's -S coordinate.
+func captureSince(target string, anchorOffset int) (string, error) {
+	_, hs, err := paneOffsetAndHistory(target)
+	if err != nil {
+		return "", err
+	}
+	rel := anchorOffset - hs
+	return tmux("capture-pane", "-p", "-t", target, "-S", strconv.Itoa(rel))
 }
 
 // cmdRun is the agent one-shot: reads stdin, pastes+submits, waits until
@@ -502,12 +584,16 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("usage: amux run <target> [--quiet 2s] [--timeout 120s] [--lines 2000] < prompt")
 	}
 	target := args[0]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	quiet := fs.Duration("quiet", 2*time.Second, "wait-idle quiescence threshold")
-	timeout := fs.Duration("timeout", 120*time.Second, "wait-idle overall timeout")
+	timeout := fs.Duration("timeout", 120*time.Second, "overall timeout (applies to wait-idle or --wait-for)")
 	interval := fs.Duration("interval", 300*time.Millisecond, "wait-idle poll interval")
 	bracketed := fs.Bool("bracketed", true, "use bracketed paste")
+	waitFor := fs.String("wait-for", "", "regex to wait for in new content (instead of wait-idle)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -551,9 +637,32 @@ func cmdRun(args []string) error {
 		return err
 	}
 
-	// wait-idle inline so we don't double-parse args.
-	if err := waitIdleFunc(target, *quiet, *timeout, *interval); err != nil {
-		return err
+	// Wait for the end condition. If --wait-for is given, match a regex
+	// in the content added since submit (deterministic). Otherwise fall
+	// back to wait-idle (heuristic).
+	if *waitFor != "" {
+		re, err := regexp.Compile(*waitFor)
+		if err != nil {
+			return fmt.Errorf("invalid --wait-for regex %q: %w", *waitFor, err)
+		}
+		deadline := time.Now().Add(*timeout)
+		for {
+			searchIn, err := captureSince(target, beforeOffset)
+			if err != nil {
+				return err
+			}
+			if re.MatchString(searchIn) {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("run: --wait-for %q did not match in %s on %s", *waitFor, *timeout, target)
+			}
+			time.Sleep(*interval)
+		}
+	} else {
+		if err := waitIdleFunc(target, *quiet, *timeout, *interval); err != nil {
+			return err
+		}
 	}
 
 	afterOffset, afterHS, err := paneOffsetAndHistory(target)
@@ -643,6 +752,47 @@ func waitIdleFunc(target string, quiet, timeout, interval time.Duration) error {
 }
 
 
+// --- log (pipe-pane → file) ------------------------------------------------
+
+// cmdLog turns on/off tmux's pipe-pane, which streams everything a pane
+// displays to a command. We use `cat >> FILE` so the file is an
+// append-only transcript. `amux log TARGET off` detaches the pipe.
+//
+// Orchestrators can use this to persist full agent transcripts without
+// polling capture-pane. One `log` call at spawn time, one `off` at
+// teardown — the file has the whole history.
+func cmdLog(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: amux log <target> <file-or-off>")
+	}
+	target, arg := args[0], args[1]
+	if err := mustExist(target); err != nil {
+		return err
+	}
+	if arg == "off" {
+		// pipe-pane with no shell-command toggles the pipe off for target.
+		_, err := tmux("pipe-pane", "-t", target)
+		return err
+	}
+	path := arg
+	if !strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "~") {
+		// Resolve to absolute — tmux runs the pipe command in its own
+		// cwd, which may not be the user's, and relative paths are a
+		// footgun.
+		wd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		path = wd + "/" + path
+	}
+	// `-o` opens the pipe if not already; with a command arg, replaces
+	// any existing pipe. `-O` appends to existing pipe output (tmux 3.4+).
+	// We use plain pipe-pane with the command — it replaces.
+	shellCmd := "cat >> " + shellQuote(path)
+	_, err := tmux("pipe-pane", "-t", target, shellCmd)
+	return err
+}
+
 // --- rename / color --------------------------------------------------------
 
 func cmdRename(args []string) error {
@@ -650,6 +800,9 @@ func cmdRename(args []string) error {
 		return fmt.Errorf("usage: amux rename <target> <new-name>")
 	}
 	target, name := args[0], args[1]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	switch {
 	case strings.Contains(target, "."):
 		// Pane: use pane title via select-pane -T.
@@ -675,6 +828,9 @@ func cmdColor(args []string) error {
 		return fmt.Errorf("usage: amux color <target> <color>  (window or pane target)")
 	}
 	target, color := args[0], args[1]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	switch {
 	case strings.Contains(target, "."):
 		// Pane: set pane-border-style. User also needs `pane-border-status`
@@ -704,6 +860,9 @@ func cmdWaitIdle(args []string) error {
 		return fmt.Errorf("usage: amux wait-idle <target> [--quiet 800ms] [--timeout 60s] [--interval 200ms]")
 	}
 	target := args[0]
+	if err := mustExist(target); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("wait-idle", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	quiet := fs.Duration("quiet", 800*time.Millisecond, "quiescence threshold")

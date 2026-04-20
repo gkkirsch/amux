@@ -476,6 +476,75 @@ func TestPasteStripsBracketedPasteSentinels(t *testing.T) {
 	}
 }
 
+// TestStrictTargetPrefixMisroute proves that after creating both "foo" and
+// "foobar" sessions, a send to "foo:0" goes ONLY to foo — tmux's own
+// prefix matching would let "foo" match "foobar" and silently misroute.
+func TestStrictTargetPrefixMisroute(t *testing.T) {
+	a := "amuxt-foo-" + fmt.Sprintf("%d", time.Now().UnixNano())
+	b := a + "bar" // b has a as a prefix
+	mustAmux(t, "", "new", a)
+	mustAmux(t, "", "new", b)
+	t.Cleanup(func() {
+		exec.Command("tmux", "kill-session", "-t", a).Run()
+		exec.Command("tmux", "kill-session", "-t", b).Run()
+	})
+	fileA := filepath.Join(t.TempDir(), "a")
+	fileB := filepath.Join(t.TempDir(), "b")
+	mustAmux(t, "", "send", a+":0", "echo hit-A > "+fileA)
+	mustAmux(t, "", "key", a+":0", "Enter")
+	mustAmux(t, "", "send", b+":0", "echo hit-B > "+fileB)
+	mustAmux(t, "", "key", b+":0", "Enter")
+
+	waitFor(t, 3*time.Second, "both files", func() bool {
+		_, errA := os.Stat(fileA)
+		_, errB := os.Stat(fileB)
+		return errA == nil && errB == nil
+	})
+	gotA, _ := os.ReadFile(fileA)
+	gotB, _ := os.ReadFile(fileB)
+	if strings.TrimSpace(string(gotA)) != "hit-A" {
+		t.Fatalf("session %s got: %q, expected hit-A", a, gotA)
+	}
+	if strings.TrimSpace(string(gotB)) != "hit-B" {
+		t.Fatalf("session %s got: %q, expected hit-B", b, gotB)
+	}
+}
+
+// TestRenamedTargetDoesNotResolve proves that after a rename, the old
+// name fails fast with a clear error — not silently routed elsewhere.
+func TestRenamedTargetDoesNotResolve(t *testing.T) {
+	sess := uniqueSession(t)
+	newName := sess + "-renamed"
+	mustAmux(t, "", "rename", sess, newName)
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", newName).Run() })
+
+	r := runAmux(t, "", "send", sess+":0", "ignored")
+	if r.exit == 0 {
+		t.Fatalf("send to renamed-away target should fail")
+	}
+	if !strings.Contains(r.stderr, "no such target") {
+		t.Fatalf("expected 'no such target' in stderr, got: %s", r.stderr)
+	}
+}
+
+// TestLooseTargetsEnvOverride proves AMUX_LOOSE_TARGETS=1 opts out of
+// strict resolution (falls back to tmux's prefix matching).
+func TestLooseTargetsEnvOverride(t *testing.T) {
+	sess := uniqueSession(t)
+	newName := sess + "-renamed"
+	mustAmux(t, "", "rename", sess, newName)
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", newName).Run() })
+
+	cmd := exec.Command(amuxBin, "send", sess+":0", "echo loose-ok")
+	cmd.Env = append(os.Environ(), "AMUX_LOOSE_TARGETS=1")
+	var out, errb bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("with AMUX_LOOSE_TARGETS=1 expected success (tmux prefix match), got %v stderr=%s", err, errb.String())
+	}
+}
+
 // --- new commands: exists / wait-for / run / rename / color --------------
 
 func TestExists(t *testing.T) {
@@ -518,6 +587,82 @@ func TestWaitForTimeout(t *testing.T) {
 	}
 	if !strings.Contains(r.stderr, "did not match") {
 		t.Fatalf("expected 'did not match' in stderr, got: %s", r.stderr)
+	}
+}
+
+// TestWaitForNewOnly proves --new-only ignores pattern hits that existed
+// on the pane before the command ran — the classic "prompt echoes its
+// own completion marker" orchestrator bug.
+func TestWaitForNewOnly(t *testing.T) {
+	sess := uniqueSession(t)
+	target := sess + ":0"
+	// Plant the marker in the pane BEFORE wait-for starts.
+	mustAmux(t, "", "send", target, "echo DONE-MARKER")
+	mustAmux(t, "", "key", target, "Enter")
+	mustAmux(t, "", "wait-for", target, "DONE-MARKER", "--timeout", "3s")
+
+	// Now with --new-only, wait-for should NOT match on the already-visible
+	// DONE-MARKER; it should wait for a NEW one.
+	done := make(chan error, 1)
+	go func() {
+		r := runAmux(t, "", "wait-for", target, "DONE-MARKER",
+			"--new-only", "--timeout", "3s", "--interval", "100ms")
+		if r.exit != 0 {
+			done <- fmt.Errorf("wait-for --new-only failed: %s", r.stderr)
+			return
+		}
+		done <- nil
+	}()
+
+	// Small delay so wait-for is polling, then emit a NEW instance.
+	time.Sleep(400 * time.Millisecond)
+	mustAmux(t, "", "send", target, "echo DONE-MARKER")
+	mustAmux(t, "", "key", target, "Enter")
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("wait-for --new-only didn't return after new marker appeared")
+	}
+}
+
+// TestWaitForNewOnlyTimesOut proves --new-only correctly times out when
+// the marker is only present in pre-invocation content.
+func TestWaitForNewOnlyTimesOut(t *testing.T) {
+	sess := uniqueSession(t)
+	target := sess + ":0"
+	mustAmux(t, "", "send", target, "echo STALE-MARKER")
+	mustAmux(t, "", "key", target, "Enter")
+	mustAmux(t, "", "wait-for", target, "STALE-MARKER", "--timeout", "3s")
+	// Let the shell finish redrawing its new prompt so the cursor is
+	// past the STALE-MARKER line before we snapshot with --new-only.
+	mustAmux(t, "", "wait-idle", target,
+		"--quiet", "300ms", "--timeout", "3s", "--interval", "80ms")
+
+	r := runAmux(t, "", "wait-for", target, "STALE-MARKER",
+		"--new-only", "--timeout", "800ms", "--interval", "100ms")
+	if r.exit == 0 {
+		t.Fatalf("wait-for --new-only with only stale marker should time out")
+	}
+}
+
+// TestRunWaitFor proves `run --wait-for PATTERN` completes on match
+// instead of heuristic idle.
+func TestRunWaitFor(t *testing.T) {
+	sess := uniqueSession(t)
+	target := sess + ":0"
+	mustAmux(t, "", "send", target, "echo PRE-RUN")
+	mustAmux(t, "", "key", target, "Enter")
+	mustAmux(t, "", "wait-for", target, "PRE-RUN", "--timeout", "3s")
+
+	out := mustAmux(t, "echo RUN-WAIT-FOR-MARKER-ZX7\n", "run", target,
+		"--wait-for", "RUN-WAIT-FOR-MARKER-ZX7", "--timeout", "5s",
+		"--interval", "100ms", "--bracketed=false")
+	if !strings.Contains(out, "RUN-WAIT-FOR-MARKER-ZX7") {
+		t.Fatalf("run --wait-for didn't emit content with marker:\n%s", out)
 	}
 }
 
@@ -617,6 +762,38 @@ func TestColorSessionErrors(t *testing.T) {
 	}
 	if !strings.Contains(r.stderr, "must be a window or pane") {
 		t.Fatalf("expected helpful error, got: %s", r.stderr)
+	}
+}
+
+// TestLog proves pipe-pane to file works and that 'off' detaches.
+func TestLog(t *testing.T) {
+	sess := uniqueSession(t)
+	logFile := filepath.Join(t.TempDir(), "transcript.log")
+	target := sess + ":0"
+
+	mustAmux(t, "", "log", target, logFile)
+	// Generate some output in the pane.
+	mustAmux(t, "", "send", target, "echo LOG-MARKER-1")
+	mustAmux(t, "", "key", target, "Enter")
+	waitFor(t, 3*time.Second, "LOG-MARKER-1 in log file", func() bool {
+		b, _ := os.ReadFile(logFile)
+		return strings.Contains(string(b), "LOG-MARKER-1")
+	})
+
+	// Turn off, generate more output, confirm it's NOT in the file.
+	mustAmux(t, "", "log", target, "off")
+	// Small beat so the pipe actually detaches before we write.
+	time.Sleep(200 * time.Millisecond)
+	mustAmux(t, "", "send", target, "echo LOG-MARKER-2-SHOULDNT-APPEAR")
+	mustAmux(t, "", "key", target, "Enter")
+	time.Sleep(500 * time.Millisecond)
+
+	b, _ := os.ReadFile(logFile)
+	if !strings.Contains(string(b), "LOG-MARKER-1") {
+		t.Fatalf("LOG-MARKER-1 not in log file:\n%s", string(b))
+	}
+	if strings.Contains(string(b), "LOG-MARKER-2") {
+		t.Fatalf("log file contains output after 'off' was issued:\n%s", string(b))
 	}
 }
 
