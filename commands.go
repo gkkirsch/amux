@@ -296,6 +296,13 @@ func cmdPaste(args []string) error {
 		return err
 	}
 	if *submit {
+		// Bracketed-paste end sentinels (\e[201~) need a beat to land
+		// in the receiving TUI before the Enter that submits. Without
+		// this sleep, multi-line pastes against Claude's TUI show
+		// "[Pasted text #N]" and the Enter gets eaten as part of the
+		// paste instead of submitting. 120ms is empirically enough
+		// while still feeling instant.
+		time.Sleep(120 * time.Millisecond)
 		if _, err := tmux("send-keys", "-t", target, "Enter"); err != nil {
 			return err
 		}
