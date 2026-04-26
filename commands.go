@@ -267,15 +267,7 @@ func cmdPaste(args []string) error {
 	fs := flag.NewFlagSet("paste", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	submit := fs.Bool("submit", false, "send Enter after paste")
-	// Bracketed paste mode (-p) reliably truncates content against
-	// Claude Code's TUI when the buffer contains a `\n- ` sequence —
-	// the receiver treats it as paste-end and drops everything after.
-	// Default to OFF; non-bracketed paste reliably delivers the full
-	// buffer (tmux converts \n → \r so paragraphs separate but the
-	// pane doesn't auto-submit on each line). Callers that genuinely
-	// need bracketed paste (e.g. inserting into a code block) can
-	// opt back in with --bracketed.
-	bracketed := fs.Bool("bracketed", false, "use bracketed paste (-p)")
+	bracketed := fs.Bool("bracketed", true, "use bracketed paste (-p)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -308,9 +300,10 @@ func cmdPaste(args []string) error {
 		// in the receiving TUI before the Enter that submits. Without
 		// this sleep, multi-line pastes against Claude's TUI show
 		// "[Pasted text #N]" and the Enter gets eaten as part of the
-		// paste instead of submitting. 120ms is empirically enough
-		// while still feeling instant.
-		time.Sleep(120 * time.Millisecond)
+		// paste instead of submitting. 250ms is empirically reliable
+		// across a wider range of message sizes while still feeling
+		// instant.
+		time.Sleep(250 * time.Millisecond)
 		if _, err := tmux("send-keys", "-t", target, "Enter"); err != nil {
 			return err
 		}
