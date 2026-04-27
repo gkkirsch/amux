@@ -13,7 +13,7 @@ programmatically talk to an agent.
 ## Install
 
 ```
-git clone ... ~/dev/amux
+git clone https://github.com/gkkirsch/amux.git ~/dev/amux
 cd ~/dev/amux
 make install      # builds + copies to ~/.local/bin/amux
 ```
