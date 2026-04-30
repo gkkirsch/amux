@@ -43,10 +43,21 @@ func shellJoin(args []string) string {
 // --- lifecycle -------------------------------------------------------------
 
 func cmdNew(args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: amux new <session>")
+	fs := flag.NewFlagSet("new", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cwd := fs.String("c", "", "working directory for the session's first window")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	_, err := tmux("new-session", "-d", "-s", args[0])
+	rest := fs.Args()
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: amux new [-c <dir>] <session>")
+	}
+	tmuxArgs := []string{"new-session", "-d", "-s", rest[0]}
+	if *cwd != "" {
+		tmuxArgs = append(tmuxArgs, "-c", *cwd)
+	}
+	_, err := tmux(tmuxArgs...)
 	return err
 }
 
@@ -61,12 +72,16 @@ func cmdWindow(args []string) error {
 	fs := flag.NewFlagSet("window", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	name := fs.String("n", "", "window name")
+	cwd := fs.String("c", "", "working directory for the new window")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	tmuxArgs := []string{"new-window", "-t", session}
 	if *name != "" {
 		tmuxArgs = append(tmuxArgs, "-n", *name)
+	}
+	if *cwd != "" {
+		tmuxArgs = append(tmuxArgs, "-c", *cwd)
 	}
 	if rem := fs.Args(); len(rem) > 0 {
 		// tmux new-window takes a single shell command string as a positional.
