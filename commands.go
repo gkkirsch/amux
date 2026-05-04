@@ -414,6 +414,13 @@ func cmdExists(args []string) error {
 // targetExists does an EXACT-name check. tmux's own `-t` resolution does
 // prefix matching ("foo" matches "foo-bar"), which makes it useless for
 // existence checks — so we enumerate and compare.
+//
+// Fallback: in some environments (e.g. when spawned as a subprocess from an
+// app without a tmux client session) list-sessions or list-windows can return
+// empty even when sessions exist, due to how tmux resolves its socket path.
+// When the enumeration finds nothing, we fall back to direct probes
+// (has-session / display-message) which use tmux's own -t resolution and are
+// unaffected by the enumeration issue.
 func targetExists(target string) (bool, error) {
 	sess, win, pane := parseTarget(target)
 
@@ -424,7 +431,16 @@ func targetExists(target string) (bool, error) {
 		}
 		return false, err
 	}
-	if !contains(sessions, sess) {
+	sessFound := contains(sessions, sess)
+	if !sessFound {
+		// Fallback: list-sessions returned nothing or didn't include this
+		// session. Try has-session as a direct probe. "=" prefix forces tmux
+		// to do an exact-name match rather than prefix matching.
+		if _, ferr := tmux("has-session", "-t", "="+sess); ferr == nil {
+			sessFound = true
+		}
+	}
+	if !sessFound {
 		return false, nil
 	}
 	if win == "" {
@@ -446,6 +462,14 @@ func targetExists(target string) (bool, error) {
 		if parts[0] == win || parts[1] == win {
 			winMatched = parts[0]
 			break
+		}
+	}
+	if winMatched == "" {
+		// Fallback: list-windows returned nothing. Try display-message as a
+		// direct probe — it exits 0 and prints the window name if the target
+		// exists, non-zero otherwise.
+		if out, ferr := tmux("display-message", "-t", sess+":"+win, "-p", "#{window_name}"); ferr == nil {
+			winMatched = strings.TrimSpace(out)
 		}
 	}
 	if winMatched == "" {
